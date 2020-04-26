@@ -253,6 +253,43 @@ class sonybravia(sofabase):
             except:
                 self.adapter.log.error('Error setting mode status %s' % payload, exc_info=True)
             return {}
+
+    class PowerSavingModeController(devices.ModeController):
+
+        @property            
+        def mode(self):
+            try:
+                otmode="%s.%s" % (self.name,self.nativeObject['PowerSavingMode']['mode'])
+                return otmode
+                self.log.info('## %s vs %s' % (otmode, self._supportedModes))
+                for mode in self._supportedModes:
+                    if otmode==[mode]:
+                        return otmode
+                return ""
+            except KeyError:
+                return ""
+                #self.adapter.log.error('Error checking mode status - no value present: %s' % self.nativeObject)
+            except:
+                self.adapter.log.error('Error checking mode status', exc_info=True)
+            return ""
+
+        async def SetMode(self, payload, correlationToken=''):
+            try:
+                if 'mode' in payload:
+                    mode=payload['mode'].split('.')[1]
+                    if mode in self._supportedModes:
+                        if self.nativeObject['PowerStatus']['status']!="active":
+                            self.log.warn('!! Warning: wont try to change power saving mode while tv is off')
+                        else:
+                            self.log.info('.. setting tv setPowerSavingMode to %s' % mode)
+                            sysinfo=await self.adapter.tv.getState('system','setPowerSavingMode',version="1.0",params={"mode": mode})
+                            await self.adapter.getUpdate()
+                        return await self.adapter.dataset.generateResponse(self.device.endpointId, correlationToken)     
+                    self.log.error('!! error - did not find mode %s in %s/%s' % (payload, self.name, self._supportedModes))
+            except:
+                self.adapter.log.error('Error setting mode status %s' % payload, exc_info=True)
+            return {}
+
                     
 
     class InputController(devices.InputController):
@@ -298,7 +335,7 @@ class sonybravia(sofabase):
                     if item['target']=='speaker':
                         return item['volume']
             except KeyError:
-                return ""
+                pass
                 #self.adapter.log.error('Error checking mode status - no value present: %s' % self.nativeObject)
             except:
                 self.log.error('!! Error during volume check', exc_info=True)
@@ -311,7 +348,7 @@ class sonybravia(sofabase):
                     if item['target']=='speaker':
                         return item['mute']
             except KeyError:
-                return ""
+                return False
                 #self.adapter.log.error('Error checking mode status - no value present: %s' % self.nativeObject)
 
             except:
@@ -395,7 +432,8 @@ class sonybravia(sofabase):
 
         async def getUpdate(self):
 
-            systemdata={    'system':       [ { 'interface': 'power', 'command':'getPowerStatus', 'listitem':0 }],
+            systemdata={    'system':       [ { 'interface': 'power', 'command':'getPowerStatus', 'listitem':0 },
+                                                { 'interface': 'system', 'command':'getPowerSavingMode', 'listitem':0 }],
                             'audio':        [ { 'interface':'audio', 'command':'getVolumeInformation', 'listitem':0},
                                                 { 'interface':'audio', 'command':'getSoundSettings', 'version':'1.1', 'listitem':0, 'params':{"target": ""}}
                                             ],
@@ -427,7 +465,7 @@ class sonybravia(sofabase):
                         if category not in alldata:
                             alldata[category]={}
                         alldata[action['command'][3:]]=sysinfo
-                    await self.dataset.ingest({'tv': { self.tvName: results }})
+                    await self.dataset.ingest({'tv': { self.tvName: results }}, mergeReplace=True)
                 return alldata
                 
             except:
@@ -516,6 +554,8 @@ class sonybravia(sofabase):
                         #    supportedModes={'audioSystem': 'Receiver', "speaker": 'TV', "speaker_hdmi":'Both', "hdmi":'HDMI'})
                         device.AudioModeController=sonybravia.AudioModeController('Audio', device=device, 
                             supportedModes={'speaker': 'Receiver', "audioSystem": 'TV'})
+                        device.PowerSavingModeController=sonybravia.PowerSavingModeController('PowerSaving', device=device, 
+                            supportedModes={'off': 'Off', "low": "Low", "high": "High", "pictureOff": "Picture Off"})
 
                         # TV is plugged into sound system so skipping speaker here, but could be added
                         return self.dataset.newaddDevice(device)
@@ -564,7 +604,7 @@ class sonybravia(sofabase):
 
                 if 'uri' in nativeObj['PlayingContentInfo']:
                     details=self.getDetailsFromURI(nativeObj['PlayingContentInfo']['uri'])
-                    if details['type'] in ['cec','hdmi']:
+                    if nativeObj['PlayingContentInfo']['uri'].startswith('extInput:cec') or details['type'] in ['cec','hdmi','player']:
                         if details['port'] in self.dataset.config['hdmi_port_names']:
                             return self.dataset.config['hdmi_port_names'][details['port']]
                 if 'title' in nativeObj['PlayingContentInfo']:

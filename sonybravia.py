@@ -5,10 +5,8 @@ import sys, os
 sys.path.append(os.path.dirname(__file__))
 sys.path.append(os.path.join(os.path.dirname(__file__),'../../base'))
 
-from sofabase import sofabase
-from sofabase import adapterbase
+from sofabase import sofabase, adapterbase, configbase
 import devices
-
 
 import math
 import random
@@ -88,14 +86,12 @@ class BroadcastProtocol:
             self.log.info("Error processing UPNP Event: %s " % upnpxml,exc_info=True)
 
 
-class sonyRest():
+class sony_rest():
 
-    def __init__(self, log=None, dataset=None):
+    def __init__(self, log=None, config=None):
+        self.config=config
         self.log=log
-        self.dataset=dataset
-        self.address=self.dataset.config['address']
-        self.port=self.dataset.config['port']
-        self.psk=self.dataset.config['psk']
+        self.tv_timeout=5
     
     async def remoteControl(self, params):
 
@@ -113,14 +109,14 @@ class sonyRest():
             '</s:Envelope>' % (params)
 
         headers = {
-            'Host': "%s:%s" % (self.address, self.port),
+            'Host': "%s:%s" % (self.config.tv_address, self.config.tv_port),
             'Content-length':len(soap),
             'Content-Type':'text/xml; charset="utf-8"',
-            'X-Auth-PSK': self.psk,
+            'X-Auth-PSK': self.config.tv_preshared_key,
             'SOAPAction':'"%s"' % (service)
             }
 
-        req = urllib.request.Request("http://%s:%s/%s" % (self.address, self.port, url), data=soap.encode('ascii'), headers=headers)
+        req = urllib.request.Request("http://%s:%s/%s" % (self.config.tv_address, self.config.tv_port, url), data=soap.encode('ascii'), headers=headers)
         req.get_method = lambda: method
 
         try:
@@ -140,16 +136,17 @@ class sonyRest():
     async def getState(self, section, method, version='1.0', params=[]):
         
         try:
-            url = "http://%s/sony/%s" % (self.address,section)
-            headers={'X-Auth-PSK': self.psk}
+            url = "http://%s/sony/%s" % (self.config.tv_address,section)
+            headers={'X-Auth-PSK': self.config.tv_preshared_key}
             command={'id':2, 'method':method, 'version':version}
             if params==[]:
                 command['params']=[]
             else:
                 command['params']=[params]
             data=json.dumps(command)
-
-            async with aiohttp.ClientSession() as client:
+            
+            timeout = aiohttp.ClientTimeout(total=self.tv_timeout)
+            async with aiohttp.ClientSession(timeout=timeout) as client:
                 response=await client.post(url, data=data, headers=headers)
                 result=await response.read()
                 result=json.loads(result.decode())
@@ -174,17 +171,31 @@ class sonyRest():
                 else:
                     self.log.info('Result has no result: %s' % result)
                     return result
+                    
+        except concurrent.futures._base.CancelledError:
+            self.log.error('!! Error sending command to TV (cancelled) - %s/%s %s' % (section, method, params) )
+            return {}
+
         except aiohttp.client_exceptions.ClientConnectorError:
-            self.log.error('!! Error connecting to TV, likely DNS or IP related')
+            self.log.error('!! Error sending command to TV (could not connect, likely DNS or IP related) - %s/%s %s' % (section, method, params) )
             return {}
                 
         except:
-            self.log.error('Error sending command', exc_info=True)
+            self.log.error('!! Error sending command to TV - %s/%s %s' % (section, method, params), exc_info=True)
             return {}
 
 
 
 class sonybravia(sofabase):
+
+    class adapter_config(configbase):
+    
+        def adapter_fields(self):
+            self.hdmi_port_names=self.set_or_default('hdmi_port_names', default={})
+            self.tv_address=self.set_or_default("tv_address", mandatory=True)
+            self.tv_port=self.set_or_default("tv_port", default=80)
+            self.tv_preshared_key=self.set_or_default("tv_preshared_key", mandatory=True)
+            self.ssdpkeywords=self.set_or_default("ssdpkeywords", default=[self.tv_address, "bravia"])
 
     class EndpointHealth(devices.EndpointHealth):
 
@@ -297,7 +308,7 @@ class sonybravia(sofabase):
         @property            
         def input(self):
             try:
-                return self.adapter.getInputName(self.nativeObject)
+                return self.adapter.parse_input_name(self.nativeObject)
             except KeyError:
                 if self.nativeObject['PowerStatus']['status']=="active":
                     return 'Android TV'
@@ -313,8 +324,8 @@ class sonybravia(sofabase):
                     sysinfo=await self.adapter.tv.remoteControl(self.adapter.findRemoteCode('Home'))
                 else:
                     inp=payload['input']
-                    for port in self.adapter.dataset.config['hdmi_port_names']:
-                        if payload['input']==self.adapter.dataset.config['hdmi_port_names'][port]:
+                    for port in self.device.adapter.config.hdmi_port_names:
+                        if payload['input']==self.device.adapter.config.hdmi_port_names[port]:
                             inp='extInput:hdmi?port=%s' % port
                             sysinfo=await self.adapter.tv.getState('avContent','setPlayContent',params={"uri":inp})
                             if inp.startswith('extInput:cec'):
@@ -357,6 +368,12 @@ class sonybravia(sofabase):
 
         async def SetVolume(self, payload, correlationToken=''):
             try:
+                for item in self.nativeObject['SoundSettings']:
+                    if item['target']=='outputTerminal':
+                        if item['currentValue']!='speaker':
+                            self.log.warning('.! cancelled attempt to set volume while the TV is not in speaker mode')
+                            return await self.adapter.dataset.generateResponse(self.device.endpointId, correlationToken)
+
                 for item in self.nativeObject['VolumeInformation']:
                     if item['target']=='speaker':
                         volrange={ 'max':item['maxVolume'], 'min':item['minVolume'] }
@@ -392,9 +409,9 @@ class sonybravia(sofabase):
     class adapterProcess(adapterbase):
 
 
-        def __init__(self, log=None, dataset=None, notify=None, request=None, loop=None, **kwargs):
+        def __init__(self, log=None, dataset=None, notify=None, request=None, loop=None, config=None, **kwargs):
+            self.config=config
             self.dataset=dataset
-            self.ssdpkeywords=self.dataset.config['ssdpkeywords']
 
             self.log=log
             self.notify=notify
@@ -479,12 +496,12 @@ class sonybravia(sofabase):
         async def start(self):
             try:
                 self.input_list=[]
-                for port in self.dataset.config['hdmi_port_names']:
-                    self.input_list.append(self.dataset.config['hdmi_port_names'][port])
+                for port in self.config.hdmi_port_names:
+                    self.input_list.append(self.config.hdmi_port_names[port])
             except:
                 self.log.error('Error defining port list', exc_info=True)
                 
-            self.tv=sonyRest(log=self.log, dataset=self.dataset)
+            self.tv=sony_rest(log=self.log, config=self.config)
             self.tvName=await self.getTVname()
 
             try:
@@ -496,7 +513,7 @@ class sonybravia(sofabase):
 
             try:
                 sock=self.make_ssdp_sock()
-                self.ssdp = self.loop.create_datagram_endpoint(lambda: BroadcastProtocol(self.loop, self.log, self.ssdpkeywords, returnmessage=self.processUPNP), sock=sock)
+                self.ssdp = self.loop.create_datagram_endpoint(lambda: BroadcastProtocol(self.loop, self.log, self.config.ssdpkeywords, returnmessage=self.processUPNP), sock=sock)
                 await self.ssdp
                 await self.pollTV()
                 
@@ -514,15 +531,6 @@ class sonybravia(sofabase):
                 except:
                     self.log.error('Error fetching TV Data', exc_info=True)
 
-            
-        async def command(self, category, item, data):
-            
-            try:
-                response=await self.receiver.sendCommand(category, item, data)
-                self.log.info('Command response: %s' % response)
-                return response
-            except:
-                self.log.error('error sending command',exc_info=True)
 
         async def addSmartDevice(self, path):
             
@@ -550,10 +558,12 @@ class sonybravia(sofabase):
                         device.SpeakerController=sonybravia.SpeakerController(device=device)
                         # On the XBR-75X850C that this was built for, there are only two actual supported modes: audioSystem and speaker
                         # and they are reversed!!  speaker will send audio to the receiver and audioSystem is the in-TV speaker
+
+                        # update 8/6/20 - tv firmware Oreo 8.0 may have now fixed it - swapping it back
                         #device.AudioModeController=sonybravia.AudioModeController('Audio', device=device, 
                         #    supportedModes={'audioSystem': 'Receiver', "speaker": 'TV', "speaker_hdmi":'Both', "hdmi":'HDMI'})
                         device.AudioModeController=sonybravia.AudioModeController('Audio', device=device, 
-                            supportedModes={'speaker': 'Receiver', "audioSystem": 'TV'})
+                            supportedModes={'speaker': 'TV', "audioSystem": 'Receiver'})
                         device.PowerSavingModeController=sonybravia.PowerSavingModeController('PowerSaving', device=device, 
                             supportedModes={'off': 'Off', "low": "Low", "high": "High", "pictureOff": "Picture Off"})
 
@@ -595,7 +605,7 @@ class sonybravia(sofabase):
                 self.log.error('Error parsing input URI: %s' % uri, exc_info=True)
                 
 
-        def getInputName(self,nativeObj):
+        def parse_input_name(self,nativeObj):
             
             try:
                 if 'PlayingContentInfo' not in nativeObj:
@@ -605,8 +615,8 @@ class sonybravia(sofabase):
                 if 'uri' in nativeObj['PlayingContentInfo']:
                     details=self.getDetailsFromURI(nativeObj['PlayingContentInfo']['uri'])
                     if nativeObj['PlayingContentInfo']['uri'].startswith('extInput:cec') or details['type'] in ['cec','hdmi','player']:
-                        if details['port'] in self.dataset.config['hdmi_port_names']:
-                            return self.dataset.config['hdmi_port_names'][details['port']]
+                        if details['port'] in self.config.hdmi_port_names:
+                            return self.config.hdmi_port_names[details['port']]
                 if 'title' in nativeObj['PlayingContentInfo']:
                     return nativeObj['PlayingContentInfo']['title']
                 else:
@@ -614,25 +624,6 @@ class sonybravia(sofabase):
                     
             except:
                 self.log.error('Error getting virtual input name for %s' % nativeObj['PlayingContentInfo'], exc_info=True)
-
-
-        async def virtualList(self, itempath, query={}):
-
-            try:
-                if itempath=="inputdata":
-                    return self.dataset.nativeDevices['tv']['BRAVIA']['inputStatus']
-
-                if itempath=="inputs":
-                    return self.dataset.config['hdmi_port_names']
-                    #return self.dataset.nativeDevices['tv']['BRAVIA']['inputStatus']
-
-                if itempath=="status":
-                    return await self.getUpdate()
-
-                return {}
-
-            except:
-                self.log.error('Error getting virtual controller types for %s' % itempath, exc_info=True)
 
 
 if __name__ == '__main__':

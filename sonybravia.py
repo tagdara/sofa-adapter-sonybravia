@@ -20,7 +20,7 @@ from collections import defaultdict
 import struct
 import socket
 import urllib.request
-
+import concurrent.futures # required for error message handling
 
 class BroadcastProtocol:
 
@@ -535,41 +535,40 @@ class sonybravia(sofabase):
         async def addSmartDevice(self, path):
             
             try:
-                if path.split("/")[2]=="BRAVIA":
-                    return self.addSmartTV(path.split("/")[2], "TV")
-                else:
-                    self.log.info('Path not adding device: %s' % path)
-
+                device_id=path.split("/")[2]
+                device_type=path.split("/")[1]
+                nativeObject=self.dataset.nativeDevices[device_type][device_id]
+                endpointId="%s:%s:%s" % ("sonybravia", device_type, device_id)
+                if endpointId not in self.dataset.localDevices:  # localDevices/friendlyNam                
+                    if device_type=="tv":
+                        return self.addSmartTV(device_id, nativeObject, "TV")
             except:
                 self.log.error('Error defining smart device', exc_info=True)
-                return False
+            return False
 
 
-        def addSmartTV(self, deviceid, name="Bravia"):
+        def addSmartTV(self, device_id, nativeObject, name="TV"):
             try:
-                nativeObject=self.dataset.nativeDevices['tv'][deviceid]
-                if name not in self.dataset.localDevices:
-                    if "SystemInformation" in nativeObject and "PowerStatus" in nativeObject:
-                        device=devices.alexaDevice('sonybravia/tv/%s' % deviceid, name, displayCategories=['TV'], adapter=self)
-                        device.PowerController=sonybravia.PowerController(device=device)
-                        device.EndpointHealth=sonybravia.EndpointHealth(device=device)
-                        device.InputController=sonybravia.InputController(device=device, inputs=self.input_list)
-                        device.RemoteController=sonybravia.RemoteController(device=device)
-                        device.SpeakerController=sonybravia.SpeakerController(device=device)
-                        # On the XBR-75X850C that this was built for, there are only two actual supported modes: audioSystem and speaker
-                        # and they are reversed!!  speaker will send audio to the receiver and audioSystem is the in-TV speaker
+                if "SystemInformation" in nativeObject and "PowerStatus" in nativeObject:
+                    device=devices.alexaDevice('sonybravia/tv/%s' % device_id, name, displayCategories=['TV'], adapter=self, description="Sony Bravia Television", 
+                                                    manufacturerName="Sony", modelName=nativeObject['SystemInformation']['model'])
+                    device.PowerController=sonybravia.PowerController(device=device)
+                    device.EndpointHealth=sonybravia.EndpointHealth(device=device)
+                    device.InputController=sonybravia.InputController(device=device, inputs=self.input_list)
+                    device.RemoteController=sonybravia.RemoteController(device=device)
+                    device.SpeakerController=sonybravia.SpeakerController(device=device)
+                    # On the XBR-75X850C that this was built for, there are only two actual supported modes: audioSystem and speaker
+                    # and they are reversed!!  speaker will send audio to the receiver and audioSystem is the in-TV speaker
 
-                        # update 8/6/20 - tv firmware Oreo 8.0 may have now fixed it - swapping it back
-                        #device.AudioModeController=sonybravia.AudioModeController('Audio', device=device, 
-                        #    supportedModes={'audioSystem': 'Receiver', "speaker": 'TV', "speaker_hdmi":'Both', "hdmi":'HDMI'})
-                        device.AudioModeController=sonybravia.AudioModeController('Audio', device=device, 
-                            supportedModes={'speaker': 'TV', "audioSystem": 'Receiver'})
-                        device.PowerSavingModeController=sonybravia.PowerSavingModeController('PowerSaving', device=device, 
-                            supportedModes={'off': 'Off', "low": "Low", "high": "High", "pictureOff": "Picture Off"})
-
-                        # TV is plugged into sound system so skipping speaker here, but could be added
-                        return self.dataset.newaddDevice(device)
-                return False
+                    # update 8/6/20 - tv firmware Oreo 8.0 may have now fixed it - swapping it back
+                    #device.AudioModeController=sonybravia.AudioModeController('Audio', device=device, 
+                    #    supportedModes={'audioSystem': 'Receiver', "speaker": 'TV', "speaker_hdmi":'Both', "hdmi":'HDMI'})
+                    device.AudioModeController=sonybravia.AudioModeController('Audio', device=device, 
+                        supportedModes={'speaker': 'TV', "audioSystem": 'Receiver'})
+                    device.PowerSavingModeController=sonybravia.PowerSavingModeController('PowerSaving', device=device, 
+                        supportedModes={'off': 'Off', "low": "Low", "high": "High", "pictureOff": "Picture Off"})
+                        
+                    return self.dataset.add_device(device)
             except:
                 self.log.error('!! Error adding smart TV', exc_info=True)
             
